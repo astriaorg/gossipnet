@@ -1,18 +1,25 @@
 /// gossipnet implements a basic gossip network using libp2p.
 /// It currently supports discovery via mdns and bootnodes, and eventually
 /// will support DHT discovery.
-
 use color_eyre::eyre::{eyre, Result, WrapErr};
-use futures::{StreamExt};
+use futures::StreamExt;
+#[cfg(feature = "dht")]
+use libp2p::kad::{
+    record::{store::MemoryStore, Key},
+    {Kademlia, KademliaConfig, KademliaEvent, QueryResult},
+};
 #[cfg(feature = "mdns")]
 use libp2p::mdns;
 use libp2p::{
     core::upgrade::Version,
     gossipsub::{self, Message, MessageId, TopicHash},
-    identity, noise, ping,
+    identity,
+    kad::GetProvidersOk,
+    noise, ping,
     swarm::{NetworkBehaviour, Swarm, SwarmBuilder, SwarmEvent},
     tcp, yamux, Multiaddr, PeerId, Transport,
 };
+use multiaddr::Protocol;
 use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
@@ -31,6 +38,8 @@ struct GossipnetBehaviour {
     gossipsub: gossipsub::Behaviour,
     #[cfg(feature = "mdns")]
     mdns: mdns::tokio::Behaviour,
+    #[cfg(feature = "dht")]
+    kademlia: Kademlia<MemoryStore>,
 }
 
 pub struct NetworkBuilder {
@@ -109,6 +118,14 @@ impl Network {
         .map_err(|e| eyre!("failed to create gossipsub behaviour: {}", e))?;
 
         let mut swarm = {
+            #[cfg(feature = "dht")]
+            let kademlia = {
+                let mut cfg = KademliaConfig::default();
+                cfg.set_query_timeout(Duration::from_secs(5 * 60));
+                let store = MemoryStore::new(local_peer_id);
+                Kademlia::with_config(local_peer_id, store, cfg)
+            };
+
             #[cfg(feature = "mdns")]
             let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)?;
             let behaviour = GossipnetBehaviour {
@@ -116,6 +133,8 @@ impl Network {
                 #[cfg(feature = "mdns")]
                 mdns,
                 ping: ping::Behaviour::default(),
+                #[cfg(feature = "dht")]
+                kademlia,
             };
             SwarmBuilder::with_tokio_executor(transport, behaviour, local_peer_id).build()
         };
@@ -126,9 +145,30 @@ impl Network {
         if let Some(addrs) = bootnodes {
             addrs.iter().try_for_each(|addr| -> Result<_> {
                 debug!("dialing {:?}", addr);
-                let remote: Multiaddr = addr.parse()?;
-                swarm.dial(remote)?;
+                let mut maddr: Multiaddr = addr.parse()?;
+                swarm.dial(maddr.clone())?;
                 debug!("dialed {addr}");
+
+                let Some(peer_id) = maddr.pop() else {
+                    return Err(eyre!("failed to parse peer id from addr: {}", addr));
+                };
+
+                match peer_id {
+                    Protocol::P2p(peer_id) => {
+                        let peer_id = match PeerId::from_multihash(peer_id) {
+                            Ok(peer_id) => peer_id,
+                            Err(e) => {
+                                return Err(eyre!("failed to parse peer id from addr: {:?}", e));
+                            }
+                        };
+
+                        swarm.behaviour_mut().kademlia.add_address(&peer_id, maddr);
+                    }
+                    _ => {
+                        return Err(eyre!("failed to parse peer id from addr: {}", addr));
+                    }
+                }
+
                 Ok(())
             })?;
         }
@@ -139,6 +179,21 @@ impl Network {
             swarm,
             terminated: false,
         })
+    }
+
+    #[cfg(feature = "dht")]
+    pub async fn bootstrap(&mut self) -> Result<()> {
+        self.swarm
+            .behaviour_mut()
+            .kademlia
+            .bootstrap()
+            .map(|_| ())
+            .map_err(|e| eyre!(e))
+    }
+
+    #[cfg(feature = "dht")]
+    pub async fn discover(&mut self, key: Key) {
+        self.swarm.behaviour_mut().kademlia.get_providers(key);
     }
 
     pub async fn publish(&mut self, message: Vec<u8>, topic: Sha256Topic) -> Result<MessageId> {
@@ -189,8 +244,54 @@ impl futures::Stream for Network {
             };
 
             match event {
+                #[cfg(feature = "dht")]
+                SwarmEvent::Behaviour(GossipnetBehaviourEvent::Kademlia(
+                    KademliaEvent::OutboundQueryProgressed { id, result, .. },
+                )) => match result {
+                    QueryResult::GetProviders(providers) => match providers {
+                        Ok(providers) => {
+                            match providers {
+                                GetProvidersOk::FoundProviders { key, providers } => {
+                                    debug!(
+                                        "found {} providers for query id {:?}, key {:?}",
+                                        providers.len(),
+                                        id,
+                                        key
+                                    );
+                                    for provider in providers {
+                                        debug!("found provider {:?}", provider);
+                                    }
+                                }
+                                GetProvidersOk::FinishedWithNoAdditionalRecord {
+                                    closest_peers,
+                                } => {
+                                    debug!("finished with no additional record");
+                                    for peer in closest_peers {
+                                        debug!("closest peer {:?}", peer);
+                                    }
+                                }
+                            };
+                        }
+                        Err(e) => {
+                            debug!("failed to find providers for {:?}: {}", id, e);
+                        }
+                    },
+                    QueryResult::Bootstrap(bootstrap) => {
+                        if bootstrap.is_err() {
+                            debug!("failed to bootstrap {:?}", id);
+                            continue;
+                        }
+
+                        debug!("bootstrapping ok");
+                    }
+                    _ => {
+                        debug!("query result for {:?}: {:?}", id, result);
+                    }
+                },
                 #[cfg(feature = "mdns")]
-                SwarmEvent::Behaviour(GossipnetBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
+                SwarmEvent::Behaviour(GossipnetBehaviourEvent::Mdns(mdns::Event::Discovered(
+                    list,
+                ))) => {
                     let peers = Vec::with_capacity(list.len());
                     for (peer_id, _multiaddr) in list {
                         debug!("mDNS discovered a new peer: {peer_id}");
@@ -202,7 +303,9 @@ impl futures::Stream for Network {
                     return Poll::Ready(Some(Event::MdnsPeersConnected(peers)));
                 }
                 #[cfg(feature = "mdns")]
-                SwarmEvent::Behaviour(GossipnetBehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
+                SwarmEvent::Behaviour(GossipnetBehaviourEvent::Mdns(mdns::Event::Expired(
+                    list,
+                ))) => {
                     let peers = Vec::with_capacity(list.len());
                     for (peer_id, _multiaddr) in list {
                         debug!("mDNS discover peer has expired: {peer_id}");
@@ -213,11 +316,13 @@ impl futures::Stream for Network {
                     }
                     return Poll::Ready(Some(Event::MdnsPeersDisconnected(peers)));
                 }
-                SwarmEvent::Behaviour(GossipnetBehaviourEvent::Gossipsub(gossipsub::Event::Message {
-                    propagation_source: peer_id,
-                    message_id: id,
-                    message,
-                })) => {
+                SwarmEvent::Behaviour(GossipnetBehaviourEvent::Gossipsub(
+                    gossipsub::Event::Message {
+                        propagation_source: peer_id,
+                        message_id: id,
+                        message,
+                    },
+                )) => {
                     debug!(
                         "Got message: '{}' with id: {id} from peer: {peer_id}",
                         String::from_utf8_lossy(&message.data),
