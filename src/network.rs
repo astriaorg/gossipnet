@@ -14,7 +14,7 @@ use libp2p::{
     core::upgrade::Version,
     gossipsub::{self, Message, MessageId, TopicHash},
     identity,
-    kad::GetProvidersOk,
+    kad::{GetProvidersError, GetProvidersOk},
     noise, ping,
     swarm::{NetworkBehaviour, Swarm, SwarmBuilder, SwarmEvent},
     tcp, yamux, Multiaddr, PeerId, Transport,
@@ -28,7 +28,7 @@ use std::{
     task::{Context, Poll},
     time::Duration,
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 pub use libp2p::gossipsub::Sha256Topic;
 
@@ -78,7 +78,8 @@ impl Default for NetworkBuilder {
 }
 
 pub struct Network {
-    pub multiaddr: Multiaddr,
+    pub multiaddrs: Vec<Multiaddr>,
+    local_peer_id: PeerId,
     swarm: Swarm<GossipnetBehaviour>,
     terminated: bool,
 }
@@ -173,9 +174,9 @@ impl Network {
             })?;
         }
 
-        let multiaddr = Multiaddr::from_str(&format!("{}/p2p/{}", listen_addr, local_peer_id))?;
         Ok(Network {
-            multiaddr,
+            multiaddrs: vec![],
+            local_peer_id,
             swarm,
             terminated: false,
         })
@@ -231,6 +232,10 @@ pub enum Event {
     MdnsPeersDisconnected(Vec<PeerId>),
     PeerConnected(PeerId),
     PeerSubscribed(PeerId, TopicHash),
+    #[cfg(feature = "dht")]
+    FoundProviders(Option<Key>, Option<Vec<PeerId>>),
+    #[cfg(feature = "dht")]
+    GetProvidersError(GetProvidersError),
 }
 
 impl futures::Stream for Network {
@@ -244,6 +249,38 @@ impl futures::Stream for Network {
             };
 
             match event {
+                // Swarm events
+                SwarmEvent::NewListenAddr { address, .. } => {
+                    debug!("Local node is listening on {address}");
+                    let maddr_str = format!("{}/p2p/{}", address, self.local_peer_id);
+                    let Ok(multiaddr) = Multiaddr::from_str(&maddr_str) else {
+                                        warn!("failed to parse multiaddr: {maddr_str}");
+                                        continue;
+                                    };
+
+                    self.multiaddrs.push(multiaddr);
+                    return Poll::Ready(Some(Event::NewListenAddr(address)));
+                }
+                SwarmEvent::ConnectionEstablished {
+                    peer_id,
+                    endpoint: _,
+                    num_established,
+                    concurrent_dial_errors: _,
+                    established_in: _,
+                } => {
+                    debug!(
+                        "Connection with {peer_id} established (total: {num_established})",
+                        peer_id = peer_id,
+                        num_established = num_established,
+                    );
+                    self.swarm
+                        .behaviour_mut()
+                        .gossipsub
+                        .add_explicit_peer(&peer_id);
+                    return Poll::Ready(Some(Event::PeerConnected(peer_id)));
+                }
+
+                // DHT events
                 #[cfg(feature = "dht")]
                 SwarmEvent::Behaviour(GossipnetBehaviourEvent::Kademlia(
                     KademliaEvent::OutboundQueryProgressed { id, result, .. },
@@ -258,27 +295,27 @@ impl futures::Stream for Network {
                                         id,
                                         key
                                     );
-                                    for provider in providers {
-                                        debug!("found provider {:?}", provider);
-                                    }
+                                    return Poll::Ready(Some(Event::FoundProviders(
+                                        Some(key),
+                                        Some(providers.into_iter().collect()),
+                                    )));
                                 }
                                 GetProvidersOk::FinishedWithNoAdditionalRecord {
-                                    closest_peers,
+                                    closest_peers: _,
                                 } => {
                                     debug!("finished with no additional record");
-                                    for peer in closest_peers {
-                                        debug!("closest peer {:?}", peer);
-                                    }
+                                    return Poll::Ready(Some(Event::FoundProviders(None, None)));
                                 }
                             };
                         }
                         Err(e) => {
                             debug!("failed to find providers for {:?}: {}", id, e);
+                            return Poll::Ready(Some(Event::GetProvidersError(e)));
                         }
                     },
                     QueryResult::Bootstrap(bootstrap) => {
                         if bootstrap.is_err() {
-                            debug!("failed to bootstrap {:?}", id);
+                            warn!(error = ?bootstrap.err(), "failed to bootstrap {:?}", id);
                             continue;
                         }
 
@@ -288,6 +325,8 @@ impl futures::Stream for Network {
                         debug!("query result for {:?}: {:?}", id, result);
                     }
                 },
+
+                // mDNS events
                 #[cfg(feature = "mdns")]
                 SwarmEvent::Behaviour(GossipnetBehaviourEvent::Mdns(mdns::Event::Discovered(
                     list,
@@ -316,6 +355,8 @@ impl futures::Stream for Network {
                     }
                     return Poll::Ready(Some(Event::MdnsPeersDisconnected(peers)));
                 }
+
+                // Gossipsub events
                 SwarmEvent::Behaviour(GossipnetBehaviourEvent::Gossipsub(
                     gossipsub::Event::Message {
                         propagation_source: peer_id,
@@ -329,10 +370,6 @@ impl futures::Stream for Network {
                     );
                     return Poll::Ready(Some(Event::Message(message)));
                 }
-                SwarmEvent::NewListenAddr { address, .. } => {
-                    debug!("Local node is listening on {address}");
-                    return Poll::Ready(Some(Event::NewListenAddr(address)));
-                }
                 SwarmEvent::Behaviour(GossipnetBehaviourEvent::Gossipsub(
                     gossipsub::Event::Subscribed { peer_id, topic },
                 )) => {
@@ -343,24 +380,7 @@ impl futures::Stream for Network {
                     );
                     return Poll::Ready(Some(Event::PeerSubscribed(peer_id, topic)));
                 }
-                SwarmEvent::ConnectionEstablished {
-                    peer_id,
-                    endpoint: _,
-                    num_established,
-                    concurrent_dial_errors: _,
-                    established_in: _,
-                } => {
-                    debug!(
-                        "Connection with {peer_id} established (total: {num_established})",
-                        peer_id = peer_id,
-                        num_established = num_established,
-                    );
-                    self.swarm
-                        .behaviour_mut()
-                        .gossipsub
-                        .add_explicit_peer(&peer_id);
-                    return Poll::Ready(Some(Event::PeerConnected(peer_id)));
-                }
+
                 _ => {
                     debug!("unhandled swarm event: {:?}", event);
                 }
