@@ -13,7 +13,7 @@ use libp2p::mdns;
 use libp2p::{
     core::upgrade::Version,
     gossipsub::{self, Message, MessageId, TopicHash},
-    identity::{Keypair},
+    identity::Keypair,
     kad::{AddProviderError, Addresses, GetProvidersError, GetProvidersOk, QueryId},
     noise, ping,
     swarm::{NetworkBehaviour, Swarm, SwarmBuilder, SwarmEvent},
@@ -75,7 +75,11 @@ impl NetworkBuilder {
     }
 
     pub fn build(self) -> Result<Network> {
-        Network::new(self.keypair.unwrap_or(Keypair::generate_ed25519()), self.bootnodes, self.port)
+        Network::new(
+            self.keypair.unwrap_or(Keypair::generate_ed25519()),
+            self.bootnodes,
+            self.port,
+        )
     }
 }
 
@@ -256,7 +260,7 @@ pub enum Event {
     #[cfg(feature = "dht")]
     ProvideError(AddProviderError),
     #[cfg(feature = "dht")]
-    RoutingUpdated(PeerId, Addresses)
+    RoutingUpdated(PeerId, Addresses),
 }
 
 impl futures::Stream for Network {
@@ -502,7 +506,12 @@ mod test {
             let topic = Sha256Topic::new(TEST_TOPIC);
 
             let bootnode = bootnode_rx.await.unwrap();
-            let mut bob = Network::new(Keypair::generate_ed25519(), Some(vec![bootnode.to_string()]), 9001).unwrap();
+            let mut bob = Network::new(
+                Keypair::generate_ed25519(),
+                Some(vec![bootnode.to_string()]),
+                9001,
+            )
+            .unwrap();
             bob.subscribe(&topic);
 
             loop {
@@ -561,8 +570,7 @@ mod test {
         let key_c = key.clone();
 
         let alice_handle = tokio::task::spawn(async move {
-            let mut alice = Network::new(
-               Keypair::generate_ed25519(), None, 9000).unwrap();
+            let mut alice = Network::new(Keypair::generate_ed25519(), None, 9000).unwrap();
 
             let Some(event) = alice.next().await else {
                 panic!("expected stream event");
@@ -620,7 +628,12 @@ mod test {
         let bob_handle = tokio::task::spawn(async move {
             bootnode_rx.changed().await.unwrap();
             let bootnode = bootnode_rx.borrow().to_owned().unwrap();
-            let mut bob = Network::new(Keypair::generate_ed25519(), Some(vec![bootnode.to_string()]), 9001).unwrap();
+            let mut bob = Network::new(
+                Keypair::generate_ed25519(),
+                Some(vec![bootnode.to_string()]),
+                9001,
+            )
+            .unwrap();
 
             let mut peer_count = 0;
             let mut found_providers_count = 0;
@@ -677,7 +690,8 @@ mod test {
         let charlie_handle = tokio::task::spawn(async move {
             charlie_bootnode_rx.changed().await.unwrap();
             let bootnode = charlie_bootnode_rx.borrow().to_owned().unwrap();
-            let mut charlie = Network::new(charlie_local_key, Some(vec![bootnode.to_string()]), 9002).unwrap();
+            let mut charlie =
+                Network::new(charlie_local_key, Some(vec![bootnode.to_string()]), 9002).unwrap();
 
             let mut peer_count = 0;
 
